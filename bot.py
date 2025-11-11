@@ -1,11 +1,11 @@
 
-import os, base64, requests, logging, json, io
+import os, base64, logging, io
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from openai import OpenAI
 from PIL import Image
 
-# (Opcional, útil para desenvolvimento local)
+# (Opcional para ambiente local)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -23,14 +23,11 @@ if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY não definido.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Guarda quando o usuário iniciou a conversa
 chat_start_times = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     from datetime import datetime, timezone, timedelta
-    # Salva o horário de início da conversa em ISO (UTC-3 por padrão)
     now = datetime.now(timezone(timedelta(hours=-3))).isoformat()
     chat_start_times[chat_id] = now
     await update.message.reply_text(
@@ -38,8 +35,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "A IA vai validar se o depósito foi feito **após o início da conversa**."
     )
 
+async def _download_telegram_file(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> bytes:
+    file = await context.bot.get_file(file_id)
+    ba = await file.download_as_bytearray()   # evita HTTP 404
+    raw = bytes(ba)
+    logging.info("Download via API: size=%d path=%s", len(raw), getattr(file, "file_path", None))
+    if not raw:
+        raise RuntimeError("Download retornou vazio.")
+    return raw
+
 def _bytes_to_png_data_url(raw: bytes) -> str:
-    """Abre bytes com Pillow e converte para PNG (RGB), retornando data URL."""
     img = Image.open(io.BytesIO(raw))
     if img.mode in ("P", "RGBA"):
         img = img.convert("RGB")
@@ -59,7 +64,6 @@ def _analyze_image_data_url(data_url: str, chat_started_at_iso: str) -> str:
     - Resultado: "Aprovado" ou "Reprovado"
     Se não achar o depósito expandido, diga isso.
     """
-
     response = client.responses.create(
         model="gpt-4o",
         input=[{
@@ -73,15 +77,6 @@ def _analyze_image_data_url(data_url: str, chat_started_at_iso: str) -> str:
     )
     return response.output_text.strip()
 
-async def _download_telegram_file(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> bytes:
-    file = await context.bot.get_file(file_id)
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-    resp = requests.get(file_url, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Download falhou (HTTP {resp.status_code})")
-    logging.info("Telegram download: Content-Type=%s bytes=%d", resp.headers.get("Content-Type",""), len(resp.content))
-    return resp.content
-
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     chat_started_at_iso = chat_start_times.get(chat_id)
@@ -90,13 +85,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # pega a melhor resolução
         photo = update.message.photo[-1]
         raw = await _download_telegram_file(context, photo.file_id)
-
-        # normaliza para PNG data URL
         data_url = _bytes_to_png_data_url(raw)
-
         result = _analyze_image_data_url(data_url, chat_started_at_iso)
         await update.message.reply_text(result[:4096])
     except Exception as e:
